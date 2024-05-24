@@ -1,0 +1,489 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CheckCollisions
+#pragma kernel HandleOverlap
+#pragma kernel CalculateRepulsion
+#pragma kernel UpdatePositions
+
+static const int numThreads = 64;
+
+// Buffers
+RWStructuredBuffer<float2> _Positions;
+RWStructuredBuffer<float2> _Velocities;
+RWStructuredBuffer<float2> _NewVelocities;
+RWStructuredBuffer<uint> _Types;
+RWStructuredBuffer<uint> _MoleculeGrid;
+
+RWStructuredBuffer<uint> _Bond1;
+RWStructuredBuffer<uint> _Bond2;
+
+RWStructuredBuffer<uint> _MoleculeBind1;
+RWStructuredBuffer<uint> _MoleculeBind2;
+
+// Constants
+static const float PI = 3.1415926535897932384626433832795f;
+const uint numParticles;
+const uint numMoleculesPerGridSpace;
+const float dt;
+const float diameter;
+const float elasticity;
+const float maxSpeed;
+const float2 boundsSize;
+
+const float2 mousePos;
+const bool mouseDown;
+
+void HandleWallCollisions(uint pIndex)
+{
+    float2 pos = _Positions[pIndex];
+    float2 vel = _Velocities[pIndex];
+
+    const float2 halfSize = boundsSize * 0.5f;
+    float2 edgeDst = halfSize - abs(pos);
+
+    if (edgeDst.x <= 0)
+    {
+        pos.x = halfSize.x * sign(pos.x);
+        vel.x *= -1 * elasticity;
+    }
+    if (edgeDst.y <= 0)
+    {
+        pos.y = halfSize.y * sign(pos.y);
+        vel.y *= -1 * elasticity;
+    }
+
+    _Positions[pIndex] = pos;
+    _NewVelocities[pIndex] = vel;
+}
+bool Colliding(uint pIndex1, uint pIndex2)
+{
+    float2 p1 = _Positions[pIndex1];
+    float2 p2 = _Positions[pIndex2];
+    float2 a = p1 - p2;
+    return dot(a, a) < diameter * diameter;
+}
+
+uint FixBonds(uint pIndex)
+{
+    // returns which bonds are available for pIndex, and removes bonds that are no longer valid
+    // 0 if no bonds available
+    // 1 if bond1 available
+    // 2 if bond2 available
+    // 3 if both bonds available
+    uint status = 0;
+
+    if (_Bond1[pIndex] == numParticles) status = 1;
+    else if (!Colliding(pIndex, _Bond1[pIndex]))
+    {
+        _Bond1[pIndex] = numParticles;
+        status = 1;
+    }
+
+    if (_Bond2[pIndex] == numParticles) status += 2;
+    else if (!Colliding(pIndex, _Bond2[pIndex]))
+    {
+        _Bond2[pIndex] = numParticles;
+        status += 2;
+    }
+
+    return status;
+}
+uint CycleLength(uint pIndex)
+{
+    uint firstIndex = pIndex;
+    uint lastIndex = pIndex;
+    uint currentIndex = pIndex;
+    if (_Bond1[pIndex] < numParticles) currentIndex = _Bond1[pIndex];
+    else if (_Bond2[pIndex] < numParticles) currentIndex = _Bond2[pIndex];
+    else return 0;
+
+    uint length = 1;
+    while (currentIndex != firstIndex)
+    {
+        // not empty && not linking backwards in the chain
+        if (_Bond1[currentIndex] < numParticles && _Bond1[currentIndex] != lastIndex) currentIndex = _Bond1[
+            currentIndex];
+        else if (_Bond2[currentIndex] < numParticles && _Bond2[currentIndex] != lastIndex) currentIndex = _Bond2[
+            currentIndex];
+        else return 0; // chain ends with no cycle
+
+        length++;
+    }
+    return length;
+}
+
+bool Link(uint pIndex1, uint pIndex2)
+{
+    bool alreadyBonded = _Bond1[pIndex1] == pIndex2 || _Bond2[pIndex1] == pIndex2;
+
+    uint status1 = FixBonds(pIndex1);
+    uint status2 = FixBonds(pIndex2);
+
+    if (!alreadyBonded)
+    {
+        if (status1 == 0 || status2 == 0) return false;
+
+        if (status1 == 1 || status1 == 3)
+        {
+            _Bond1[pIndex1] = pIndex2;
+        }
+        else if (status1 == 2)
+        {
+            _Bond2[pIndex1] = pIndex2;
+        }
+
+        if (status2 == 1 || status2 == 3)
+        {
+            _Bond1[pIndex2] = pIndex1;
+        }
+        else if (status2 == 2)
+        {
+            _Bond2[pIndex2] = pIndex1;
+        }
+    }
+
+    float2 p1 = _Positions[pIndex1];
+    float2 p2 = _Positions[pIndex2];
+
+    float2 nrm = p2 - p1; // vector pointing in the direction of p2 from p1
+    float2 mid = p1 + (nrm * 0.5f); // add half the normal vector to p1 to get the midpoint btw p1 and p2
+
+    //uint cycleLength = min(CycleLength(pIndex1), CycleLength(pIndex2));
+    float bondLength = 0.375f;
+
+    //if (cycleLength == 3) bondLength = 0.475f;
+    //else if (cycleLength == 4) bondLength = 0.425f;
+
+    float2 rectDist = normalize(nrm) * diameter * bondLength; // the correct distance for the particles to be
+
+    _Positions[pIndex1] = mid - rectDist;
+    _Positions[pIndex2] = mid + rectDist;
+
+    return true;
+}
+void LinkedExchange(uint pIndex1, uint pIndex2)
+{
+    // normal component of vA gets su to vB, vA is tan vA + norm vB
+    float2 p1 = _Positions[pIndex1];
+    float2 p2 = _Positions[pIndex2];
+    float2 v1 = _Velocities[pIndex1];
+    float2 v2 = _Velocities[pIndex2];
+
+    float2 nrm = normalize(p2 - p1); // unit normal vector (pointing from p1 to p2)
+    float2 tan = float2(-nrm.y, nrm.x); // unit vector 90º CCW of normal (tangent)
+
+    float2 v1TanFinal = dot(v1, tan) * tan;
+    float2 v2TanFinal = dot(v2, tan) * tan;
+
+    float2 v1Nrm = dot(v1, nrm) * nrm;
+    float2 v2Nrm = dot(v2, nrm) * nrm;
+
+    float2 v1Final = v1TanFinal + 0.5f * (v1Nrm + v2Nrm);
+    float2 v2Final = v2TanFinal + 0.5f * (v2Nrm + v1Nrm);
+
+    _Velocities[pIndex1] = v1Final;
+    _Velocities[pIndex2] = v2Final;
+}
+
+void PushBack(uint pIndex1, uint pIndex2)
+{
+    float2 p1 = _Positions[pIndex1];
+    float2 p2 = _Positions[pIndex2];
+
+    float2 nrm = p2 - p1; // vector pointing in the direction of p2 from p1
+    float2 mid = p1 + (nrm * 0.5f); // add half the normal vector to p1 to get the midpoint btw p1 and p2
+    float2 rectDist = normalize(nrm) * diameter * 0.50005f; // the correct distance for the particles to be
+    // + means towards p2, - means towards p1;
+
+    _Positions[pIndex1] = mid - rectDist;
+    _Positions[pIndex2] = mid + rectDist;
+}
+void HandleBallCollision(uint pIndex1, uint pIndex2)
+{
+    float2 p1 = _Positions[pIndex1];
+    float2 p2 = _Positions[pIndex2];
+    float2 v1 = _Velocities[pIndex1];
+    float2 v2 = _Velocities[pIndex2];
+
+    float2 nrm = normalize(p2 - p1); // unit normal vector (pointing from p1 to p2)
+    float2 tan = float2(-nrm.y, nrm.x); // unit vector 90º CCW of normal (tangent)
+
+    // there is no tangential force between the particles
+    float2 v1TanFinal = dot(v1, tan) * tan; // tangent component of v1
+    float2 v2TanFinal = dot(v2, tan) * tan; // tangent component of v2
+
+    // the true collision can be determined as a one-dimensional collision along the normal vector
+    float2 v1NrmFinal = dot(v2, nrm) * nrm * elasticity; // normal component of v2
+    float2 v2NrmFinal = dot(v1, nrm) * nrm * elasticity; // normal component of v1
+
+    // re-combine the final tangent and normal components, and multiply by the elasticity
+    _NewVelocities[pIndex1] = (v1TanFinal + v1NrmFinal);
+    _NewVelocities[pIndex2] = (v2TanFinal + v2NrmFinal);
+}
+
+int InteractionClass(int type = 0)
+{
+    // class 1 - mol interactions
+    // Synt, Chlo, Chan, Lyss
+    if (type == 1 || type == 8 || type == 10 || type == 11 || type == 13) return 1;
+
+    // class 2 - dna interactions
+    // Ribo and Dpol
+    if (type == 2 || type == 3 || type == 14) return 2;
+
+    // class 3 - ion interactions
+    // Term and Ions
+    if (type == 9 || type == 12) return 3;
+
+    // class 4 - mol
+    // molecules only
+    if (type == 13) return 4;
+
+    // class 5 - dna
+    // DNA only
+    if (type == 14) return 5;
+
+    // class 6 - wall
+    // walls only
+    if (type == 7) return 6;
+
+    // class 0 - no  interactions
+    // everything else
+    return 0;
+}
+int InteractionType(int t1 = 0, int t2 = 0)
+{
+    t1 = InteractionClass(t1);
+    t2 = InteractionClass(t2);
+
+    // molecule/dna class + molecule -> mol interaction
+    if (((t1 == 1 || t1 == 2) && t2 == 4) || (t1 == 4 && (t2 == 1 || t2 == 2))) return 1;
+
+    // dna class + dna -> dna interaction
+    if ((t1 == 4 && t2 == 5) || (t1 == 5 && t2 == 4)) return 2;
+
+    // both ion class -> ion interaction
+    if (t1 == 3 && t2 == 3) return 3;
+
+    // both wall or both dna -> chain interaction
+    if ((t1 == 6 && t2 == 6) || (t1 == 5 && t2 == 5)) return 4;
+
+    // else -> no  interaction
+    return 0;
+}
+
+void HandleBallPickup(uint pIndex1, uint pIndex2)
+{
+    float2 v1 = _Velocities[pIndex1];
+    float2 v2 = _Velocities[pIndex2];
+    int type1 = InteractionClass(_Types[pIndex1]);
+    int type2 = InteractionClass(_Types[pIndex2]);
+
+    if (type1 == 1 || type1 == 2)
+    {
+        _Velocities[pIndex1] += v2;
+        _Velocities[pIndex2] = 0;
+    }
+    else if (type2 == 1 || type2 == 2)
+    {
+        _Velocities[pIndex2] += v1;
+        _Velocities[pIndex1] = 0;
+    }
+}
+
+int MoleculeGridIndex(float2 pos)
+{
+    return pos.y * boundsSize.x * numMoleculesPerGridSpace + pos.x * numMoleculesPerGridSpace;
+}
+int MoleculePresent(float2 pos, uint molecule)
+{
+    int index = MoleculeGridIndex(pos);
+    for (int i = index; i < index + numMoleculesPerGridSpace; i++)
+    {
+        if (_MoleculeGrid[i] == molecule) return i;
+    }
+    return -1;
+}
+int GridHasSpace(float2 pos)
+{
+    int index = MoleculeGridIndex(pos);
+    for (int i = index; i < index + numMoleculesPerGridSpace; i++)
+    {
+        if (_MoleculeGrid[i] == 0) return i;
+    }
+    return -1;
+}
+
+int4 MoleculeAttributes(uint molecule)
+{
+    int4 attributes;
+    int availableSites = 0;
+    
+    int element = molecule & 0x0000000F; // Chlorine (4 bits)
+    attributes += element * int4(2,4,1,-2);
+    availableSites -= element;
+
+    element = (molecule >> 4) & 0x0000000F; // Fluorine (4 bits)
+    attributes += element * int4(4,6,1,-3);
+    availableSites -= element;
+
+    element = (molecule >> 8) & 0x0000000F; // Sulfur (4 bits)
+    attributes += element * int4(2,3,1,1);
+
+    element = (molecule >> 12) & 0x0000000F; // Phosphorus (4 bits)
+    attributes += element * int4(1,2,-1,-1);
+    availableSites += element;
+
+    element = (molecule >> 16) & 0x0000001F; // Nitrogen (5 bits)
+    attributes += element * int4(3,2,1,3);
+    availableSites += element;
+
+    element = (molecule >> 21) & 0x0000001F; // Oxygen (5 bits)
+    attributes += element * int4(2,1,-2,2);
+
+    element = molecule >> 26; // Carbon (6 bits)
+    attributes += element * int4(1,2,-1,1);
+    availableSites += 2 * element;
+
+    attributes += (availableSites / 2) * int4(1,0,-1,0);
+
+    return attributes;
+}
+
+[numthreads(numThreads,1,1)]
+void CheckCollisions(uint3 id : SV_DispatchThreadID)
+{
+    // safety case
+    if (id.x >= numParticles) return;
+
+    _NewVelocities[id.x] = _Velocities[id.x];
+
+    for (uint i = id.x + 1; i < numParticles; i++)
+    {
+        // if one or the other is invisible, skip
+        //if(_Render[id.x] == 0 || _Render[i] == 0) continue;
+
+        // if the distance between the two masses is greater than the diameter of the balls, they are not colliding
+        if (Colliding(id.x, i))
+        {
+            HandleBallCollision(id.x, i);
+        }
+    }
+}
+
+[numthreads(numThreads,1,1)]
+void HandleOverlap(uint3 id : SV_DispatchThreadID)
+{
+    // safety case
+    if (id.x >= numParticles) return;
+    
+    HandleWallCollisions(id.x);
+
+    int t1 = _Types[id.x];
+
+    for (uint i = 0; i < numParticles; i++)
+    {
+        if (i == id.x) continue;
+        int t2 = _Types[i];
+
+        int interactionType = InteractionType(t1, t2);
+
+        if (Colliding(id.x, i))
+        {
+            if (t1 == t2 && t1 == 7)
+            {
+                bool linked = Link(id.x, i);
+                if (Link(id.x, i))
+                {
+                    LinkedExchange(id.x, i);
+                }
+                else
+                {
+                    PushBack(id.x, i);
+                    HandleBallCollision(id.x, i);
+                }
+            }
+            else
+            {
+                PushBack(id.x, i);
+                HandleBallCollision(id.x, i);
+            }
+        }
+    }
+}
+
+[numthreads(numThreads,1,1)]
+void CalculateRepulsion(uint3 id : SV_DispatchThreadID)
+{
+    // safety case
+    if (id.x >= numParticles) return;
+    if (!(_Types[id.x] == 9 || _Types[id.x] == 12)) return;
+
+    float2 acc = float2(0, 0);
+
+    for (uint i = 0; i < numParticles; i++)
+    {
+        if (i == id.x) continue;
+        if (!(_Types[i] == 9 || _Types[i] == 12)) continue;
+
+        int relCharge = (_Types[id.x] == _Types[i]) ? 1 : -1;
+
+        float2 a = _Positions[id.x] - _Positions[i];
+        float2 nrm = normalize(a);
+        float2 force = nrm / dot(a, a);
+
+        // if the ions are colliding, accelerating them towards each other will make them pass through each other
+        //if(dot(a, a) < diameter * diameter && relCharge == -1) continue;
+
+        acc += relCharge * force * dt;
+    }
+
+    _NewVelocities[id.x] += acc;
+}
+
+[numthreads(numThreads,1,1)]
+void UpdatePositions(uint3 id : SV_DispatchThreadID)
+{
+    // safety case
+    if (id.x >= numParticles) return;
+
+    // update the velocity of the particle
+    _Velocities[id.x] = _NewVelocities[id.x];
+
+    // clamp the speed of the particle
+    if (maxSpeed > 0 && dot(_Velocities[id.x], _Velocities[id.x]) > maxSpeed * maxSpeed)
+    {
+        _Velocities[id.x] = normalize(_Velocities[id.x]) * maxSpeed;
+    }
+
+    // update the position of the particle
+    _Positions[id.x] += _Velocities[id.x] * dt;
+}
+
+[numthreads(numThreads,1,1)]
+void RunMoleculeInteractions(uint3 id : SV_DispatchThreadID)
+{
+    // safety case
+    if (id.x >= numParticles) return;
+
+    if(_Types[id.x] == 1)
+    {
+        int mol1 = MoleculePresent(_Positions[id.x], _MoleculeBind1[id.x]);
+        int mol2 = MoleculePresent(_Positions[id.x], _MoleculeBind2[id.x]);
+
+        if(mol1 >= 0 && mol2 >= 0)
+        {
+            _MoleculeGrid[mol1] = _MoleculeGrid[mol1] + _MoleculeGrid[mol2];
+            _MoleculeGrid[mol2] = 0;
+        }
+    } else if(_Types[id.x] == 11)
+    {
+        int mol = MoleculePresent(_Positions[id.x], _MoleculeBind1[id.x] + _MoleculeBind2[id.x]);
+        int space = GridHasSpace(_Positions[id.x]);
+
+        if(mol >= 0 && space >= 0)
+        {
+            _MoleculeGrid[mol] = _MoleculeBind1[id.x];
+            _MoleculeGrid[space] = _MoleculeBind2[id.x];
+        }
+    }
+}
